@@ -3,7 +3,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.db import 夹具目录, 连接
-from app.services import 回放, 抽取, 目录, 装载
+from app.services import 回放, 抽取, 目录, 装载, 切日租约, 切日切点, 切日夹具, 快照回滚
 
 路由 = APIRouter(prefix="/api")
 
@@ -11,11 +11,40 @@ from app.services import 回放, 抽取, 目录, 装载
 class 装载请求(BaseModel):
     批次编号: str = ""
     流水: list = Field(default_factory=list)
+    租约秒: float = 切日租约.默认租约秒
+    等待秒: float = 切日租约.默认等待秒
 
 
 class 营业日请求(BaseModel):
     营业日: str
     批次编号: str = ""
+    租约秒: float = 切日租约.默认租约秒
+    等待秒: float = 切日租约.默认等待秒
+
+
+class 切点请求(BaseModel):
+    至营业日: str
+    持有方: str = "切点调度"
+    租约秒: float = 切日租约.默认租约秒
+    等待秒: float = 切日租约.默认等待秒
+
+
+class 租约请求(BaseModel):
+    租约号: str
+    备注: str = "人工撤销"
+
+
+class 续租请求(BaseModel):
+    租约号: str
+    增量秒: float
+
+
+class 回滚请求(BaseModel):
+    抽取批次编号: str
+
+
+class 夹具请求(BaseModel):
+    名: str
 
 
 @路由.get("/健康")
@@ -160,6 +189,11 @@ def 列回放批():
     return _列批("回放批次")
 
 
+@路由.get("/切日批次")
+def 列切日批():
+    return _列批("切日批次")
+
+
 @路由.get("/夹具")
 def 列夹具():
     if not 夹具目录.exists():
@@ -167,16 +201,75 @@ def 列夹具():
     return sorted(p.name for p in 夹具目录.glob("*.json"))
 
 
-@路由.post("/装载")
-def 执行装载(体: 装载请求):
+@路由.get("/切日/夹具")
+def 列切日夹具():
+    return 切日夹具.列切日夹具()
+
+
+@路由.post("/切日/运行夹具")
+def 运行切日夹具(体: 夹具请求):
     try:
-        return 装载.装载流水(体.流水, 体.批次编号)
+        return 切日夹具.运行切日夹具(体.名)
+    except FileNotFoundError as e:
+        raise HTTPException(404, str(e)) from e
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
 
 
-class 夹具请求(BaseModel):
-    名: str
+# ---- 切日互斥核证接口：持有方、租约截止、valid（口径乙：配对租约排队）----
+
+@路由.get("/切日/核证")
+def 切日核证(租约号: str = ""):
+    return 切日租约.核证(租约号 or None)
+
+
+@路由.get("/切日/排队")
+def 切日排队():
+    return 切日租约.排队视图()
+
+
+@路由.post("/切日/切点")
+def 切日执行(体: 切点请求):
+    return 切日切点.执行切点(体.至营业日, 体.持有方, 体.租约秒, 体.等待秒)
+
+
+@路由.post("/切日/撤销")
+def 切日撤销(体: 租约请求):
+    ok = 切日租约.撤销租约(体.租约号, 体.备注)
+    if not ok:
+        raise HTTPException(404, "租约不存在或已失效")
+    return {"完成": True, **切日租约.核证()}
+
+
+@路由.post("/切日/续租")
+def 切日续租(体: 续租请求):
+    try:
+        切日租约.续租(体.租约号, 体.增量秒)
+    except 切日租约.租约异常 as e:
+        raise HTTPException(400, str(e)) from e
+    return {"完成": True, **切日租约.核证(体.租约号)}
+
+
+@路由.post("/切日/回滚快照")
+def 切日回滚快照(体: 回滚请求):
+    try:
+        return 快照回滚.回滚快照(体.抽取批次编号)
+    except 切日租约.租约异常 as e:
+        raise HTTPException(409, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+
+
+@路由.post("/装载")
+def 执行装载(体: 装载请求):
+    try:
+        return 装载.装载流水(体.流水, 体.批次编号, 租约秒=体.租约秒, 等待秒=体.等待秒)
+    except 切日租约.排队超时 as e:
+        raise HTTPException(409, str(e)) from e
+    except 切日租约.租约已失 as e:
+        raise HTTPException(409, str(e)) from e
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 @路由.post("/装载夹具/{名}")
@@ -195,13 +288,20 @@ def _装载夹具文件(名: str):
         raise HTTPException(404, f"夹具不存在: {名}")
     data = json.loads(path.read_text(encoding="utf-8"))
     流水 = data.get("流水") or data.get("事件") or []
-    return 装载.装载流水(流水, str(data.get("批次编号") or ""))
+    try:
+        return 装载.装载流水(流水, str(data.get("批次编号") or ""))
+    except 切日租约.租约异常 as e:
+        raise HTTPException(409, str(e)) from e
 
 
 @路由.post("/抽取")
 def 执行抽取(体: 营业日请求):
     try:
-        return 抽取.日终抽取(体.营业日, 体.批次编号)
+        return 抽取.日终抽取(体.营业日, 体.批次编号, 租约秒=体.租约秒, 等待秒=体.等待秒)
+    except 切日租约.排队超时 as e:
+        raise HTTPException(409, str(e)) from e
+    except 切日租约.租约已失 as e:
+        raise HTTPException(409, str(e)) from e
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
 
@@ -209,7 +309,11 @@ def 执行抽取(体: 营业日请求):
 @路由.post("/回放")
 def 执行回放(体: 营业日请求):
     try:
-        return 回放.回放核对(体.营业日, 体.批次编号)
+        return 回放.回放核对(体.营业日, 体.批次编号, 租约秒=体.租约秒, 等待秒=体.等待秒)
+    except 切日租约.排队超时 as e:
+        raise HTTPException(409, str(e)) from e
+    except 切日租约.租约已失 as e:
+        raise HTTPException(409, str(e)) from e
     except ValueError as e:
         raise HTTPException(400, str(e)) from e
 
@@ -229,6 +333,9 @@ def 重置():
             "跳变记录",
             "旁置簿",
             "装载批次",
+            "切日租约",
+            "切日排队",
+            "切日批次",
         ):
             conn.execute(f"DELETE FROM {t}")
         conn.commit()

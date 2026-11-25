@@ -5,11 +5,13 @@ export default function 变动流水() {
   const [夹具, set夹具] = useState([]);
   const [选, set选] = useState("三日连环样例.json");
   const [行, set行] = useState([]);
+  const [证, set证] = useState(null);
   const [讯, set讯] = useState("");
 
   const 刷新 = async () => {
     set行(await api.流水());
     set夹具(await api.夹具());
+    set证(await api.切日核证());
   };
 
   useEffect(() => {
@@ -19,7 +21,10 @@ export default function 变动流水() {
   return (
     <div>
       <h1 className="题">变动流水</h1>
-      <p className="述">装入账户增减流水，供日终抽取累计。</p>
+      <p className="述">装入账户增减流水，供日终抽取累计。装载批须持切日租约（口径乙·配对租约排队），失租约整笔回滚不留半笔。</p>
+      <div className="提示条">
+        切日核证：{证?.valid ? `持有方=${证.持有方}，valid=true，截止=${Number(证.租约截止).toFixed(1)}` : "无有效租约（装载时自动排队取得）"}
+      </div>
       <div className="行">
         <select value={选} onChange={(e) => set选(e.target.value)}>
           {夹具.map((n) => (

@@ -1,4 +1,5 @@
 from app.db import 连接
+from app.services import 切日租约
 
 
 def 总览() -> dict:
@@ -7,7 +8,7 @@ def 总览() -> dict:
         def 数(sql: str) -> int:
             return int(conn.execute(sql).fetchone()[0])
 
-        return {
+        out = {
             "账户数": 数("SELECT COUNT(*) FROM 账户"),
             "流水数": 数("SELECT COUNT(*) FROM 变动流水 WHERE 命运='已入账'"),
             "快照数": 数("SELECT COUNT(*) FROM 周期快照 WHERE 状态='有效'"),
@@ -18,5 +19,13 @@ def 总览() -> dict:
             "抽取批次数": 数("SELECT COUNT(*) FROM 抽取批次"),
             "回放批次数": 数("SELECT COUNT(*) FROM 回放批次"),
         }
+        out["切日口径"] = 切日租约.口径
+        out["双成功允许"] = 切日租约.双成功允许
+        out["失败闭批次数"] = 数(
+            "SELECT (SELECT COUNT(*) FROM 装载批次 WHERE 状态='失败闭')"
+            " + (SELECT COUNT(*) FROM 抽取批次 WHERE 状态='失败闭')"
+            " + (SELECT COUNT(*) FROM 回放批次 WHERE 状态='失败闭')"
+        )
+        return out
     finally:
         conn.close()

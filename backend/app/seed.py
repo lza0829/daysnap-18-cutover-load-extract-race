@@ -89,7 +89,47 @@ CREATE TABLE IF NOT EXISTS 装载批次 (
   时刻 TEXT NOT NULL,
   报告 TEXT NOT NULL DEFAULT '{}'
 );
+-- 切日互斥实体：同一时刻至多一行有效（valid=1）。所有互斥语义以本表为准，禁止进程内私有锁。
+CREATE TABLE IF NOT EXISTS 切日租约 (
+  租约号 TEXT PRIMARY KEY,
+  持有方 TEXT NOT NULL,
+  作业种类 TEXT NOT NULL,
+  取得时刻 REAL NOT NULL,
+  租约截止 REAL NOT NULL,
+  排队号 INTEGER,
+  valid INTEGER NOT NULL DEFAULT 1
+);
+-- 库级硬约束：至多一个有效租约（部分唯一索引），双有效租约在写入层即不可能成立。
+CREATE UNIQUE INDEX IF NOT EXISTS 租约唯一有效 ON 切日租约(valid) WHERE valid=1;
+-- FIFO 配对排队：装载/抽取/切点/回放/回滚同票排队，禁止无租约闯入。
+CREATE TABLE IF NOT EXISTS 切日排队 (
+  排队号 INTEGER PRIMARY KEY AUTOINCREMENT,
+  持有方 TEXT NOT NULL,
+  作业种类 TEXT NOT NULL,
+  入队时刻 REAL NOT NULL,
+  状态 TEXT NOT NULL DEFAULT '等待',
+  租约号 TEXT NOT NULL DEFAULT '',
+  备注 TEXT NOT NULL DEFAULT ''
+);
+-- 切点动作台账：营业日推进同样持租约，与装载批/抽取批/快照回滚同票。
+CREATE TABLE IF NOT EXISTS 切日批次 (
+  编号 TEXT PRIMARY KEY,
+  自营业日 TEXT NOT NULL,
+  至营业日 TEXT NOT NULL,
+  时刻 TEXT NOT NULL,
+  租约号 TEXT NOT NULL DEFAULT '',
+  状态 TEXT NOT NULL DEFAULT '成功',
+  报告 TEXT NOT NULL DEFAULT '{}'
+);
 """
+
+# 既有库补列（幂等）：租约号把业务写与租约实体绑成同票；批次状态区分失败闭。
+补列 = {
+    "装载批次": [("租约号", "TEXT NOT NULL DEFAULT ''"), ("状态", "TEXT NOT NULL DEFAULT '成功'")],
+    "抽取批次": [("租约号", "TEXT NOT NULL DEFAULT ''"), ("状态", "TEXT NOT NULL DEFAULT '成功'")],
+    "回放批次": [("租约号", "TEXT NOT NULL DEFAULT ''"), ("状态", "TEXT NOT NULL DEFAULT '成功'")],
+    "周期快照": [("租约号", "TEXT NOT NULL DEFAULT ''")],
+}
 
 空桩模块 = [
     "开户首日无前日",
@@ -121,9 +161,18 @@ def 此刻() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _补列迁移(conn) -> None:
+    for 表, 列们 in 补列.items():
+        已有 = {r["name"] for r in conn.execute(f"PRAGMA table_info({表})")}
+        for 列, 声明 in 列们:
+            if 列 not in 已有:
+                conn.execute(f"ALTER TABLE {表} ADD COLUMN {列} {声明}")
+
+
 def 初始化库() -> None:
     conn = 连接()
     conn.executescript(建表)
+    _补列迁移(conn)
     if conn.execute("SELECT COUNT(*) AS c FROM 台参").fetchone()["c"] == 0:
         for k, v in {
             "站名": "日镜账",
@@ -132,6 +181,9 @@ def 初始化库() -> None:
             "断档处置": "记断档并继续",
             "缺前日策略": "以零为开端",
             "重复抽取": "盖写同日快照",
+            "切日口径": "配对租约排队（乙）：双成功允许，须守恒，禁止无租约写入",
+            "默认租约秒": "30",
+            "默认排队等待秒": "60",
         }.items():
             conn.execute("INSERT INTO 台参(键, 值) VALUES (?, ?)", (k, v))
     if conn.execute("SELECT COUNT(*) AS c FROM 账户").fetchone()["c"] == 0:
